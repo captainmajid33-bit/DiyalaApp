@@ -10,8 +10,10 @@ jobs:
         with:
           java-version: '21'
           distribution: 'temurin'
+      - name: Install pnpm
+        run: npm install -g pnpm
       - name: Install Dependencies
-        run: npm install
+        run: pnpm install
       - name: Sync Capacitor
         run: npx cap sync android
       - name: Force Environment Compatibility
