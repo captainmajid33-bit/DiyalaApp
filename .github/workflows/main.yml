@@ -5,30 +5,24 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
-      
       - name: set up JDK 21
         uses: actions/setup-java@v3
         with:
           java-version: '21'
           distribution: 'temurin'
-
-      - name: Install and Build inside www
+      - name: Install pnpm
+        run: npm install -g pnpm
+      - name: Install Dependencies
+        run: pnpm install --no-frozen-lockfile --ignore-scripts
+      - name: Sync Capacitor
+        run: npx cap sync
+      - name: Build with Gradle
         run: |
-          cd www
-          npm install -g pnpm
-          pnpm install --no-frozen-lockfile --ignore-scripts
-          npx cap sync
-          
-          # الانتقال لمجلد الأندرويد داخل الـ www
           cd android
           chmod +x gradlew
           ./gradlew assembleDebug --warning-mode all
-          
-          # نسخ الـ APK إلى المجلد الرئيسي
-          cp app/build/outputs/apk/debug/app-debug.apk ../../app-debug.apk
-
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: app-debug
-          path: app-debug.apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
