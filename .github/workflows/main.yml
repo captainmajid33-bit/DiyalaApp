@@ -13,9 +13,7 @@ jobs:
       - name: Install pnpm
         run: npm install -g pnpm
       - name: Install Dependencies
-        run: |
-          pnpm install --no-frozen-lockfile
-          pnpm approve-builds --global
+        run: pnpm install --no-frozen-lockfile --ignore-scripts
       - name: Sync Capacitor
         run: npx cap sync android
       - name: Force Environment Compatibility
