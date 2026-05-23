@@ -15,7 +15,7 @@ jobs:
       - name: Install Dependencies
         run: pnpm install --no-frozen-lockfile --ignore-scripts
       - name: Sync Capacitor
-        run: npx cap sync
+        run: npx cap sync android
       - name: Build with Gradle
         run: |
           cd android
