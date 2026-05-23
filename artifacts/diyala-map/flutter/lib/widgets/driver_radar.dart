@@ -1,0 +1,545 @@
+// ============================================================================
+//  driver_radar.dart
+//  ديالى — رادار سائقي التكسي المتاحين في الوقت الفعلي
+//
+//  يستخدم StreamBuilder + .snapshots() للتحديث اللحظي بدون إعادة تسجيل دخول.
+//  بمجرد أن يضغط السائق "مفتوح/مغلق" في تطبيقه، يتحدث الرادار في أجزاء
+//  من الثانية تلقائياً.
+//
+//  الشروط الثلاثة المطلوبة معاً:
+//    1. driverType == 'taxi'      ← فئة التكسي فقط (استبعاد الغاز وغيره)
+//    2. isOnline  == true         ← التطبيق مفتوح والسائق متصل
+//    3. status    == 'available'  ← ليس في رحلة حالية
+//
+//  الاستخدام في pubspec.yaml:
+//    dependencies:
+//      cloud_firestore: ^5.x.x
+//      geolocator:      ^11.x.x
+//
+//  كيفية الاستخدام:
+//    DriverRadar(
+//      customerLat: position.latitude,
+//      customerLng: position.longitude,
+//      onDriverSelected: (driver) { ... },
+//    )
+// ============================================================================
+
+import 'dart:async';
+import 'dart:math' as math;
+
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:flutter/material.dart';
+
+// ── Design tokens ─────────────────────────────────────────────────────────────
+const _kBg     = Color(0xFF05080F);
+const _kSurf   = Color(0xFF0D1117);
+const _kGreen  = Color(0xFF00F5D4);
+const _kYellow = Color(0xFFF5C518);
+const _kBlue   = Color(0xFF00D4FF);
+const _kRed    = Color(0xFFFF2D78);
+const _kPurple = Color(0xFF7B2FF7);
+const _kDim    = Color(0xFF4A5568);
+
+// ── Driver model ──────────────────────────────────────────────────────────────
+class TaxiDriver {
+  final String  docId;
+  final String  phone;
+  final String  name;
+  final double  lat;
+  final double  lng;
+  final double  distanceKm;
+  final bool    isOnline;
+  final String  status;
+  final String  driverType;
+
+  const TaxiDriver({
+    required this.docId,
+    required this.phone,
+    required this.name,
+    required this.lat,
+    required this.lng,
+    required this.distanceKm,
+    required this.isOnline,
+    required this.status,
+    required this.driverType,
+  });
+}
+
+// ── Haversine distance ─────────────────────────────────────────────────────────
+double _haversineKm(double lat1, double lng1, double lat2, double lng2) {
+  const r = 6371.0;
+  final dLat = (lat2 - lat1) * math.pi / 180;
+  final dLng = (lng2 - lng1) * math.pi / 180;
+  final a = math.sin(dLat / 2) * math.sin(dLat / 2) +
+      math.cos(lat1 * math.pi / 180) *
+          math.cos(lat2 * math.pi / 180) *
+          math.sin(dLng / 2) *
+          math.sin(dLng / 2);
+  return r * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a));
+}
+
+// ── Firestore bool helper (Flutter writes bool, web may write string) ─────────
+bool _isTruthy(dynamic val) {
+  if (val == null) return false;
+  if (val is bool) return val;
+  return val.toString().toLowerCase() == 'true';
+}
+
+bool _isAvailable(dynamic val) {
+  return val?.toString().toLowerCase() == 'available';
+}
+
+bool _isTaxiType(dynamic val) {
+  if (val == null) return true; // حقل غير موجود → نعتبره تكسي (backward-compat)
+  final s = val.toString().toLowerCase();
+  return s == 'taxi' || s.isEmpty;
+}
+
+// ── TaxiRadarEngine ───────────────────────────────────────────────────────────
+// المحرك الرئيسي للرادار — ثلاثة فلاتر server-side مباشرةً على Firestore:
+//
+//   driverType == 'taxi'    ← فئة التكسي فقط (String — آمن server-side)
+//   isOnline   == true      ← السائق مفتوح التطبيق الآن (bool — Flutter يكتبه bool)
+//   status     == 'available' ← غير مشغول برحلة (String — آمن server-side)
+//
+// ملاحظة Firestore Index: هذا الاستعلام المركّب يحتاج composite index على:
+//   Collection: drivers
+//   Fields: driverType ASC, isOnline ASC, status ASC
+// أنشئه من Firebase Console → Firestore → Indexes → Add composite index
+// أو شغّل: firebase deploy --only firestore:indexes
+//
+// .snapshots() يفتح اتصالاً حياً دائماً — أي تغيير في أي سائق يُطلق rebuild
+// في أقل من 500ms دون أي تدخل من المستخدم.
+class TaxiRadarEngine {
+  TaxiRadarEngine._(); // prevent instantiation — static only
+
+  static Stream<QuerySnapshot<Map<String, dynamic>>> streamAvailableTaxiDrivers() {
+    return FirebaseFirestore.instance
+        .collection('drivers')
+        .where('driverType', isEqualTo: 'taxi')      // server-side ✅
+        .where('isOnline',   isEqualTo: true)         // server-side ✅ (Flutter writes bool)
+        .where('status',     isEqualTo: 'available')  // server-side ✅
+        .snapshots();
+  }
+}
+
+// ── TaxiOrderRouter ───────────────────────────────────────────────────────────
+// محرك التوجيه المتسلسل: يُرسل الطلب للسائقين واحداً تلو الآخر دون إلغاء الرحلة.
+//
+// القانون الصارم:
+//   ✅ driver_rejected | timeout → انتقل للسائق التالي (status يبقى 'searching')
+//   ✅ كل السائقين جُرّبوا ولم يقبل أحد → status = 'no_drivers_found'
+//   ❌ ممنوع منعاً باتاً: استدعاء cancelOrder() أو تغيير status → 'cancelled'
+//      إلا إذا ضغط الزبون زر الإلغاء يدوياً (خارج هذه الدالة تماماً)
+//
+// الاستخدام:
+//   final router = TaxiOrderRouter();
+//   await router.assignOrderToNextDriver(rideId, driverIds, 0);
+//   // عند إغلاق الشاشة أو إلغاء الزبون يدوياً:
+//   router.dispose();
+class TaxiOrderRouter {
+  // الاشتراك الحالي — نحتفظ بمرجع واحد فقط لضمان إلغائه قبل فتح الجديد
+  StreamSubscription<DocumentSnapshot<Map<String, dynamic>>>? _rideSub;
+
+  // ── الدالة الرئيسية ───────────────────────────────────────────────────────
+  Future<void> assignOrderToNextDriver(
+    String       rideId,
+    List<String> availableDriverIds,
+    int          currentIndex,
+  ) async {
+    // 1. أوقف الاستماع للسائق السابق قبل البدء بالجديد (منع memory leaks)
+    await _rideSub?.cancel();
+    _rideSub = null;
+
+    // 2. انتهت قائمة السائقين دون قبول → أغلق الطلب بـ 'no_drivers_found'
+    if (currentIndex >= availableDriverIds.length) {
+      await FirebaseFirestore.instance
+          .collection('rides')
+          .doc(rideId)
+          .update({'status': 'no_drivers_found'});
+      return;
+    }
+
+    final targetDriverId = availableDriverIds[currentIndex];
+
+    // 3. حدّث وثيقة الرحلة: سائق جديد + عداد جديد + status يبقى 'searching'
+    //    ⚠ لا يُغيَّر status إلى 'cancelled' هنا أبداً
+    await FirebaseFirestore.instance
+        .collection('rides')
+        .doc(rideId)
+        .update({
+          'currentDriverId': targetDriverId,
+          'status':          'searching', // ← يبقى مفتوحاً دائماً
+          'timer':           15,          // ← عداد جديد 15 ثانية
+        });
+
+    // 4. استمع لرد السائق الحالي فقط (قبول / رفض / انتهاء وقت)
+    _rideSub = FirebaseFirestore.instance
+        .collection('rides')
+        .doc(rideId)
+        .snapshots()
+        .listen((rideDoc) {
+      if (!rideDoc.exists) return;
+      final status = (rideDoc.data()?['status'] as String?) ?? '';
+
+      if (status == 'accepted') {
+        // السائق قَبِل → أوقف الاستماع وانتهى البحث بنجاح
+        _rideSub?.cancel();
+        _rideSub = null;
+        return;
+      }
+
+      if (status == 'driver_rejected' || status == 'timeout') {
+        // ⚠ ممنوع منعاً باتاً استدعاء cancelOrder() هنا
+        // فقط ننتقل للسائق التالي في القائمة
+        _rideSub?.cancel();
+        _rideSub = null;
+        assignOrderToNextDriver(rideId, availableDriverIds, currentIndex + 1);
+      }
+    });
+  }
+
+  // ── تنظيف الموارد ─────────────────────────────────────────────────────────
+  // استدعِ dispose() عند إغلاق الشاشة أو عند إلغاء الزبون يدوياً
+  void dispose() {
+    _rideSub?.cancel();
+    _rideSub = null;
+  }
+}
+
+// ── DriverRadar widget — StatelessWidget + StreamBuilder ──────────────────────
+// لا initState ، لا dispose ، لا StreamSubscription يدوي.
+// Flutter يدير دورة حياة الـ Stream تلقائياً: يفتحه عند البناء ويغلقه عند التدمير.
+class DriverRadar extends StatelessWidget {
+  final double                      customerLat;
+  final double                      customerLng;
+  final double                      radiusKm;
+  final void Function(TaxiDriver)?  onDriverSelected;
+
+  const DriverRadar({
+    super.key,
+    required this.customerLat,
+    required this.customerLng,
+    this.radiusKm = 15.0,
+    this.onDriverSelected,
+  });
+
+  // ── تحويل snapshot → قائمة TaxiDriver مُرتّبة ────────────────────────────
+  // Firestore أرسل فقط السائقين الذين يطابقون الشروط الثلاثة (server-side).
+  // نحتاج هنا فقط للإحداثيات + المسافة — باقي الفلاتر أُنجزت قبل الوصول.
+  // نحتفظ بـ _isTruthy/_isAvailable كشبكة أمان لحالات edge-case نادرة.
+  List<TaxiDriver> _parseDrivers(QuerySnapshot<Map<String, dynamic>> snap) {
+    final drivers = <TaxiDriver>[];
+
+    for (final doc in snap.docs) {
+      final d = doc.data();
+
+      // شبكة أمان client-side — تُعالج edge-cases نادرة:
+      // مثل: وثيقة تجاوزت الفلتر بسبب تأخر الـ index أو كتابة String بدل bool
+      if (!_isTruthy(d['isOnline']))    continue;
+      if (!_isAvailable(d['status']))   continue;
+      if (!_isTaxiType(d['driverType'])) continue;
+
+      // الإحداثيات
+      final lat = (d['lat'] as num?)?.toDouble() ??
+                  (d['latitude'] as num?)?.toDouble();
+      final lng = (d['lng'] as num?)?.toDouble() ??
+                  (d['longitude'] as num?)?.toDouble();
+      if (lat == null || lng == null) continue;
+
+      // فلتر المسافة — لا يمكن تطبيقه server-side في Firestore
+      final distKm = _haversineKm(customerLat, customerLng, lat, lng);
+      if (distKm > radiusKm) continue;
+
+      drivers.add(TaxiDriver(
+        docId:      doc.id,
+        phone:      (d['phone']      as String?) ?? '',
+        name:       (d['name']       as String?) ??
+                    (d['driverName'] as String?) ?? 'سائق',
+        lat:        lat,
+        lng:        lng,
+        distanceKm: distKm,
+        isOnline:   true,
+        status:     'available',
+        driverType: 'taxi',
+      ));
+    }
+
+    drivers.sort((a, b) => a.distanceKm.compareTo(b.distanceKm));
+    return drivers;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+      // TaxiRadarEngine.streamAvailableTaxiDrivers() يُطلق Firestore stream بثلاثة
+      // فلاتر server-side: driverType + isOnline + status.
+      // كل تغيير في أي سائق يُطلق rebuild فوري في < 500ms.
+      stream: TaxiRadarEngine.streamAvailableTaxiDrivers(),
+      builder: (context, snapshot) {
+        // حالة التحميل الأولي
+        if (snapshot.connectionState == ConnectionState.waiting) {
+          return _buildLoading();
+        }
+
+        // حالة الخطأ (مثل: missing composite index)
+        if (snapshot.hasError) {
+          return _buildError(snapshot.error.toString());
+        }
+
+        // لا بيانات بعد
+        if (!snapshot.hasData) return _buildLoading();
+
+        // تحويل + فلتر المسافة client-side فقط (الباقي أنجزه Firestore)
+        final drivers = _parseDrivers(snapshot.data!);
+
+        if (drivers.isEmpty) return _buildEmpty();
+
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            // عنوان الرادار
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+              child: Row(
+                children: [
+                  Container(
+                    width: 3, height: 20,
+                    color: _kGreen,
+                    margin: const EdgeInsets.only(right: 8),
+                  ),
+                  Text(
+                    'سائقو التكسي المتاحون  ·  ${drivers.length}',
+                    style: const TextStyle(
+                      fontFamily: 'Orbitron',
+                      fontSize: 10,
+                      color: _kGreen,
+                      letterSpacing: 1.4,
+                    ),
+                  ),
+                  const Spacer(),
+                  _PulseDot(color: _kGreen),
+                ],
+              ),
+            ),
+
+            // قائمة السائقين — تتحدث لحظة بلحظة
+            ListView.builder(
+              shrinkWrap:  true,
+              physics:     const NeverScrollableScrollPhysics(),
+              itemCount:   drivers.length,
+              itemBuilder: (_, i) => _DriverCard(
+                driver: drivers[i],
+                onTap:  () => onDriverSelected?.call(drivers[i]),
+              ),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  // ── حالات المساعدة ────────────────────────────────────────────────────────
+  Widget _buildLoading() => Container(
+    height: 120,
+    alignment: Alignment.center,
+    child: const SizedBox(
+      width: 28, height: 28,
+      child: CircularProgressIndicator(strokeWidth: 2, color: _kPurple),
+    ),
+  );
+
+  Widget _buildEmpty() => Container(
+    margin: const EdgeInsets.all(16),
+    padding: const EdgeInsets.symmetric(vertical: 24, horizontal: 16),
+    decoration: BoxDecoration(
+      color: _kSurf,
+      border: Border.all(color: _kDim.withOpacity(0.3)),
+      borderRadius: BorderRadius.circular(4),
+    ),
+    child: const Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Icon(Icons.local_taxi_outlined, color: _kDim, size: 32),
+        SizedBox(height: 8),
+        Text(
+          'لا يوجد سائقو تكسي متاحون حالياً',
+          style: TextStyle(fontFamily: 'Rajdhani', fontSize: 13, color: _kDim),
+          textAlign: TextAlign.center,
+        ),
+        SizedBox(height: 4),
+        Text(
+          'سيظهر السائق فور اتصاله بالتطبيق',
+          style: TextStyle(fontFamily: 'Rajdhani', fontSize: 11,
+              color: Color(0xFF2D3748)),
+          textAlign: TextAlign.center,
+        ),
+      ],
+    ),
+  );
+
+  Widget _buildError(String msg) => Container(
+    margin: const EdgeInsets.all(16),
+    padding: const EdgeInsets.symmetric(vertical: 16, horizontal: 16),
+    decoration: BoxDecoration(
+      color: _kSurf,
+      border: Border.all(color: _kRed.withOpacity(0.4)),
+      borderRadius: BorderRadius.circular(4),
+    ),
+    child: Row(
+      children: [
+        const Icon(Icons.warning_amber_rounded, color: _kRed, size: 18),
+        const SizedBox(width: 8),
+        Expanded(
+          child: Text(
+            'تعذّر تحميل الرادار',
+            style: const TextStyle(fontFamily: 'Rajdhani', fontSize: 12,
+                color: _kRed),
+          ),
+        ),
+      ],
+    ),
+  );
+}
+
+// ── Driver card ────────────────────────────────────────────────────────────────
+class _DriverCard extends StatelessWidget {
+  final TaxiDriver driver;
+  final VoidCallback onTap;
+  const _DriverCard({required this.driver, required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    final distStr = driver.distanceKm < 1
+        ? '${(driver.distanceKm * 1000).toStringAsFixed(0)} م'
+        : '${driver.distanceKm.toStringAsFixed(1)} كم';
+
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+        decoration: BoxDecoration(
+          color: _kSurf,
+          border: Border.all(color: _kGreen.withOpacity(0.25)),
+          borderRadius: BorderRadius.circular(4),
+          boxShadow: [
+            BoxShadow(
+              color: _kGreen.withOpacity(0.06),
+              blurRadius: 8, spreadRadius: 0,
+            ),
+          ],
+        ),
+        child: Row(
+          children: [
+            // أيقونة التكسي
+            Container(
+              width: 38, height: 38,
+              decoration: BoxDecoration(
+                color: _kGreen.withOpacity(0.08),
+                border: Border.all(color: _kGreen.withOpacity(0.35)),
+                borderRadius: BorderRadius.circular(4),
+              ),
+              child: const Icon(Icons.local_taxi, color: _kGreen, size: 20),
+            ),
+            const SizedBox(width: 10),
+            // اسم السائق + هاتف
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    driver.name,
+                    style: const TextStyle(
+                      fontFamily: 'Rajdhani',
+                      fontSize: 14,
+                      fontWeight: FontWeight.w700,
+                      color: Colors.white,
+                    ),
+                  ),
+                  Text(
+                    driver.phone,
+                    style: const TextStyle(
+                      fontFamily: 'Rajdhani',
+                      fontSize: 11,
+                      color: _kDim,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            // المسافة
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+              decoration: BoxDecoration(
+                color: _kBlue.withOpacity(0.08),
+                border: Border.all(color: _kBlue.withOpacity(0.3)),
+                borderRadius: BorderRadius.circular(3),
+              ),
+              child: Text(
+                distStr,
+                style: const TextStyle(
+                  fontFamily: 'Orbitron',
+                  fontSize: 9,
+                  color: _kBlue,
+                  letterSpacing: 0.6,
+                ),
+              ),
+            ),
+            const SizedBox(width: 6),
+            // سهم التوجيه
+            const Icon(Icons.chevron_right, color: _kDim, size: 18),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// ── Pulsing dot indicator ──────────────────────────────────────────────────────
+class _PulseDot extends StatefulWidget {
+  final Color color;
+  const _PulseDot({required this.color});
+  @override
+  State<_PulseDot> createState() => _PulseDotState();
+}
+
+class _PulseDotState extends State<_PulseDot>
+    with SingleTickerProviderStateMixin {
+  late AnimationController _ctrl;
+  late Animation<double>   _anim;
+
+  @override
+  void initState() {
+    super.initState();
+    _ctrl = AnimationController(
+      vsync:    this,
+      duration: const Duration(milliseconds: 1200),
+    )..repeat(reverse: true);
+    _anim = Tween<double>(begin: 0.3, end: 1.0)
+        .animate(CurvedAnimation(parent: _ctrl, curve: Curves.easeInOut));
+  }
+
+  @override
+  void dispose() { _ctrl.dispose(); super.dispose(); }
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: _anim,
+      builder: (_, __) => Container(
+        width: 8, height: 8,
+        decoration: BoxDecoration(
+          shape: BoxShape.circle,
+          color: widget.color.withOpacity(_anim.value),
+          boxShadow: [
+            BoxShadow(
+              color: widget.color.withOpacity(_anim.value * 0.6),
+              blurRadius: 6, spreadRadius: 2,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
