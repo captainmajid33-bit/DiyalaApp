@@ -5,33 +5,35 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
-      - name: set up JDK 21
-        uses: actions/setup-java@v3
-        with:
-          java-version: '21'
-          distribution: 'temurin'
-      - name: Install pnpm
-        run: npm install -g pnpm
-      - name: Install Dependencies
-        run: pnpm install --no-frozen-lockfile --ignore-scripts
-      - name: Fix Directory Structure
+      
+      # 1. كشف مكان الملفات
+      - name: Debug - Find package.json
+        run: find . -name "package.json"
+        
+      # 2. بناء الديناميكي (سيجد الملف أينما كان)
+      - name: Build with Dynamic Path
         run: |
-          # إنشاء مجلد www إذا لم يكن موجوداً
-          mkdir -p www
-          # نقل ملفات الـ HTML والـ JS والـ CSS إلى داخل www
-          # نستخدم find للبحث عن أي ملف من هذه الأنواع ونقله للمجلد
-          find . -maxdepth 1 -name "*.html" -exec mv {} www/ \; 2>/dev/null || true
-          find . -maxdepth 1 -name "*.js" -exec mv {} www/ \; 2>/dev/null || true
-          find . -maxdepth 1 -name "*.css" -exec mv {} www/ \; 2>/dev/null || true
-      - name: Sync Capacitor
-        run: npx cap sync
-      - name: Build with Gradle
-        run: |
+          # البحث عن مكان ملف package.json
+          PROJECT_ROOT=$(find . -name "package.json" -exec dirname {} \;)
+          echo "Found project at: $PROJECT_ROOT"
+          cd "$PROJECT_ROOT"
+          
+          # تنصيب الأدوات
+          npm install -g pnpm
+          pnpm install --no-frozen-lockfile --ignore-scripts
+          
+          # المزامنة والبناء
+          npx cap sync
+          
           cd android
           chmod +x gradlew
           ./gradlew assembleDebug --warning-mode all
+          
+          # البحث عن ملف الـ APK ونسخه
+          find . -name "app-debug.apk" -exec cp {} ../.. \;
+
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: app-debug
-          path: android/app/build/outputs/apk/debug/app-debug.apk
+          path: app-debug.apk
