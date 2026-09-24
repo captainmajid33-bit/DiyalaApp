@@ -1,7 +1,7 @@
 import { useState, useEffect } from "react";
 import { doc, onSnapshot } from "firebase/firestore";
 import { db } from "@/lib/firebase";
-import { MapItem, Category } from "@/data/types";
+import { MapItem, Category, ShopDeal, ShopDealsStatus } from "@/data/types";
 import { Phone, Clock, MapPin, User, AlertTriangle, Navigation, XCircle, Star, CalendarCheck } from "lucide-react";
 import { AnimatePresence, motion } from "framer-motion";
 import { Button } from "@/components/ui/button";
@@ -10,6 +10,8 @@ import { DoctorBookingModal } from "@/components/DoctorBookingModal";
 interface SidebarProps {
   item: MapItem | null;
   categories: Category[];
+  shopDeals: ShopDeal[];
+  shopDealsStatus: ShopDealsStatus;
   onClose: () => void;
   userLocation: { lat: number; lng: number } | null;
   onNavigate: (item: MapItem) => void;
@@ -41,7 +43,7 @@ const FALLBACK_COLORS: Record<string, string> = {
   gas_station: '#f5c518',
 };
 
-export function Sidebar({ item, categories, onClose, userLocation, onNavigate, routeTarget, onClearRoute }: SidebarProps) {
+export function Sidebar({ item, categories, shopDeals, shopDealsStatus, onClose, userLocation, onNavigate, routeTarget, onClearRoute }: SidebarProps) {
   const [bookingOpen,  setBookingOpen]  = useState(false);
   const [isAvailable,  setIsAvailable]  = useState<boolean | null>(null); // null = loading
 
@@ -75,6 +77,14 @@ export function Sidebar({ item, categories, onClose, userLocation, onNavigate, r
   const details      = getDetails(item);
   const rating       = (item as any).rating as number | undefined;
   const isClinic     = item.kind === 'clinic';
+  const normalizedCategory = (String(item.kind) + " " + String(item.category)).normalize("NFKC").toLocaleLowerCase();
+  const isShop = normalizedCategory.includes("shop") || normalizedCategory.includes("store") || normalizedCategory.includes("محل") || normalizedCategory.includes("متجر");
+  const matchingShopDeals = isShop ? shopDeals.filter((deal) =>
+    deal.shopLocationId === String(item.id) &&
+    deal.status === "active" &&
+    Number.isFinite(new Date(deal.expiresAt).getTime()) &&
+    new Date(deal.expiresAt).getTime() > Date.now()
+  ) : [];
 
   return (
     <>
@@ -209,6 +219,43 @@ export function Sidebar({ item, categories, onClose, userLocation, onNavigate, r
               <InfoRow icon={<Phone size={14}/>}   label="الهاتف"      value={item.phone}   color={accentColor} mono/>
               <InfoRow icon={<Clock size={14}/>}   label="ساعات العمل" value={item.hours}   color={accentColor} mono/>
             </div>
+
+            {isShop && (
+              <section aria-label="عروض المحل" style={{ padding: '10px 12px', border: '1px solid rgba(245,197,24,0.35)', background: 'rgba(245,197,24,0.05)', borderRadius: '4px', display: 'flex', flexDirection: 'column', gap: '9px' }}>
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '8px' }}>
+                  <strong style={{ color: '#f5c518', fontFamily: 'Rajdhani,sans-serif', fontSize: '16px' }}>عروض المحل</strong>
+                  {matchingShopDeals.length > 0 && <span style={{ color: '#f5c518', fontFamily: 'Orbitron,sans-serif', fontSize: '10px' }}>{matchingShopDeals.length}</span>}
+                </div>
+                {matchingShopDeals.length > 0 ? (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                    {matchingShopDeals.map((deal) => (
+                      <article key={deal.id} style={{ display: 'flex', gap: '9px', padding: '9px', border: '1px solid rgba(245,197,24,0.18)', background: 'rgba(0,0,0,0.22)', borderRadius: '3px' }}>
+                        {deal.shopImageUrl && <img src={deal.shopImageUrl} alt="" loading="lazy" style={{ width: '56px', height: '56px', objectFit: 'cover', flexShrink: 0, borderRadius: '3px', background: 'rgba(245,197,24,0.08)' }} />}
+                        <div style={{ minWidth: 0, display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                          <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: '8px' }}>
+                            <strong style={{ color: '#f4f7ff', fontFamily: 'Rajdhani,sans-serif', fontSize: '15px', lineHeight: 1.2 }}>{deal.title}</strong>
+                            <span style={{ flexShrink: 0, color: '#f5c518', fontFamily: 'Rajdhani,sans-serif', fontWeight: 700, fontSize: '13px' }}>
+                              {deal.discountType === 'percent' ? String(deal.discountValue) + '%' : deal.discountValue.toLocaleString('ar-IQ') + ' د.ع'}
+                            </span>
+                          </div>
+                          {deal.conditions && <p style={{ margin: 0, color: 'rgba(244,247,255,0.7)', fontFamily: 'Rajdhani,sans-serif', fontSize: '13px' }}>{deal.conditions}</p>}
+                          {deal.code && <div style={{ color: 'rgba(244,247,255,0.75)', fontFamily: 'Rajdhani,sans-serif', fontSize: '12px' }}>رمز العرض: <code dir="ltr" style={{ color: '#f5c518', fontFamily: 'monospace' }}>{deal.code}</code></div>}
+                          <div style={{ color: 'rgba(244,247,255,0.5)', fontFamily: 'Rajdhani,sans-serif', fontSize: '11px' }}>
+                            ينتهي: {new Date(deal.expiresAt).toLocaleString('ar-IQ', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })}
+                          </div>
+                        </div>
+                      </article>
+                    ))}
+                  </div>
+                ) : shopDealsStatus === 'loading' ? (
+                  <div style={{ color: 'rgba(244,247,255,0.55)', fontFamily: 'Rajdhani,sans-serif', fontSize: '13px' }}>جاري تحميل العروض...</div>
+                ) : shopDealsStatus === 'error' ? (
+                  <div role="status" style={{ color: '#ffb4ab', fontFamily: 'Rajdhani,sans-serif', fontSize: '13px' }}>تعذّر تحميل العروض. ستتم إعادة المحاولة تلقائياً.</div>
+                ) : (
+                  <div style={{ color: 'rgba(244,247,255,0.55)', fontFamily: 'Rajdhani,sans-serif', fontSize: '13px' }}>لا توجد عروض فعّالة لهذا المحل حالياً.</div>
+                )}
+              </section>
+            )}
 
             {/* ── Doctor Availability Badge + Booking Button ── */}
             {isClinic && (
