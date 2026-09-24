@@ -12,6 +12,7 @@ import storageRouter from "./storage";
 import ratingsRouter from "./ratings";
 import gasOrdersRouter from "./gas-orders";
 import gameRouter from "./game";
+import shopDealsRouter from "./shop-deals";
 
 const router: IRouter = Router();
 
@@ -28,5 +29,6 @@ router.use(storageRouter);
 router.use(ratingsRouter);
 router.use(gasOrdersRouter);
 router.use(gameRouter);
+router.use(shopDealsRouter);
 
 export default router;

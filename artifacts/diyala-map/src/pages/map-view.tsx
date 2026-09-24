@@ -5,13 +5,32 @@ import { ClinicMap } from "@/components/ClinicMap";
 import { AdminModal } from "@/components/AdminModal";
 import { UserLoginOverlay } from "@/components/UserLoginOverlay";
 import { UserMenu } from "@/components/UserMenu";
-import { MapItem, Category } from "@/data/types";
+import { MapItem, Category, ShopDeal, ShopDealsStatus } from "@/data/types";
 
 const POLL_MS = 30_000; // 30 s fallback poll (SSE handles real-time)
+
+function isShopDeal(value: unknown): value is ShopDeal {
+  if (!value || typeof value !== "object") return false;
+  const deal = value as Record<string, unknown>;
+  return typeof deal.id === "string" &&
+    typeof deal.title === "string" &&
+    typeof deal.conditions === "string" &&
+    (deal.discountType === "percent" || deal.discountType === "amount") &&
+    typeof deal.discountValue === "number" &&
+    typeof deal.shopName === "string" &&
+    typeof deal.shopLocationId === "string" &&
+    typeof deal.shopImageUrl === "string" &&
+    typeof deal.code === "string" &&
+    deal.status === "active" &&
+    typeof deal.createdAt === "string" &&
+    typeof deal.expiresAt === "string";
+}
 
 export function MapView() {
   const [items, setItems] = useState<MapItem[]>([]);
   const [categories, setCategories] = useState<Category[]>([]);
+  const [shopDeals, setShopDeals] = useState<ShopDeal[]>([]);
+  const [shopDealsStatus, setShopDealsStatus] = useState<ShopDealsStatus>("loading");
   const [activeFilter, setActiveFilter] = useState<string>("");
   const [loading, setLoading] = useState(true);
 
@@ -50,6 +69,27 @@ export function MapView() {
     const iv = setInterval(fetchAll, POLL_MS);
     return () => clearInterval(iv);
   }, [fetchAll]);
+
+  const fetchShopDeals = useCallback(async () => {
+    try {
+      const response = await fetch("/api/shop-deals", { headers: { Accept: "application/json" } });
+      if (!response.ok) throw new Error("Shop offers unavailable");
+      const payload: unknown = await response.json();
+      if (!payload || typeof payload !== "object" || !("deals" in payload) || !Array.isArray(payload.deals) || !payload.deals.every(isShopDeal)) {
+        throw new Error("Invalid shop offers response");
+      }
+      setShopDeals(payload.deals);
+      setShopDealsStatus("ready");
+    } catch {
+      setShopDealsStatus("error");
+    }
+  }, []);
+
+  useEffect(() => {
+    void fetchShopDeals();
+    const iv = setInterval(() => void fetchShopDeals(), POLL_MS);
+    return () => clearInterval(iv);
+  }, [fetchShopDeals]);
 
   // ── SSE — instant real-time updates from partner app or admin ─────────────
   useEffect(() => {
@@ -158,6 +198,8 @@ export function MapView() {
         <Sidebar
           item={selectedItem}
           categories={categories}
+          shopDeals={shopDeals}
+          shopDealsStatus={shopDealsStatus}
           onClose={() => { setSelectedItem(null); setRouteTarget(null); }}
           userLocation={userLocation}
           onNavigate={setRouteTarget}

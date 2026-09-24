@@ -30,3 +30,20 @@ export interface Category {
   color: string;
   icon: string;
 }
+
+export interface ShopDeal {
+  id: string;
+  title: string;
+  conditions: string;
+  discountType: "percent" | "amount";
+  discountValue: number;
+  shopName: string;
+  shopLocationId: string;
+  shopImageUrl: string;
+  code: string;
+  status: "active";
+  createdAt: string;
+  expiresAt: string;
+}
+
+export type ShopDealsStatus = "loading" | "ready" | "error";
